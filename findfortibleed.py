@@ -29,61 +29,251 @@ HEADERS = {
 }
 
 
+IPV4_PATTERN = r"(?:\d{1,3}\.){3}\d{1,3}"
+
+TOKEN_PATTERN = re.compile(
+    rf"{IPV4_PATTERN}\s*-\s*{IPV4_PATTERN}"      # 192.168.1.20-192.168.1.25
+    rf"|{IPV4_PATTERN}/\d{{1,2}}"                # 192.168.1.0/24
+    rf"|{IPV4_PATTERN}\s*-\s*\d{{1,3}}"          # 192.168.1.20-25
+    rf"|{IPV4_PATTERN}"                          # 192.168.1.1
+)
+
+
 # ============================================================
-# INPUT / VALIDATION FUNCTIONS
+# INPUT PARSING / EXPANSION
 # ============================================================
 
-def split_targets(text: str) -> list[str]:
+def extract_input_tokens(text: str) -> list[str]:
     """
-    Accept newline, comma, semicolon, tab, or space separated IP/CIDR values.
+    Extract IP-like tokens from free text.
+
+    Supports:
+        192.168.1.1
+        192.168.1.0/24
+        192.168.1.20-25
+        192.168.1.20-192.168.1.25
+        A.192.168.1.0/24
+        B. 192.168.1.0/24
+
+    Because it uses regex search, labels like A. or B. are ignored automatically.
     """
+
     if not text:
         return []
 
-    items = re.split(r"[\s,;]+", text.strip())
-    return [item.strip() for item in items if item.strip()]
+    found = []
+
+    for match in TOKEN_PATTERN.finditer(text):
+        token = match.group(0)
+        token = token.replace(" ", "")
+        token = token.strip().strip(",;")
+        found.append(token)
+
+    return found
 
 
-def normalize_target(target: str) -> str:
+def expand_single_token(
+    token: str,
+    cidr_mode: str,
+    max_ips_per_token: int,
+) -> tuple[list[dict], dict | None]:
     """
-    Validate and normalize IP or CIDR.
+    Expand a single IP/CIDR/range token into scan targets.
 
-    Examples:
-    103.40.132.1     -> 103.40.132.1
-    103.40.132.5/22  -> 103.40.132.0/22
+    Supports:
+        192.168.1.1                  -> single IP
+        192.168.1.0/24                -> CIDR
+        192.168.1.20-25               -> last-octet range
+        192.168.1.20-192.168.1.25     -> full IP range
+
+    cidr_mode:
+        - "expand": expand CIDR into individual host IPs
+        - "keep": keep CIDR as one API query
     """
-    target = target.strip()
 
-    if "/" in target:
-        return str(ipaddress.ip_network(target, strict=False))
+    token = token.strip()
 
-    return str(ipaddress.ip_address(target))
+    try:
+        # CIDR
+        if "/" in token:
+            network = ipaddress.ip_network(token, strict=False)
+            normalized_cidr = str(network)
+
+            if cidr_mode == "keep":
+                return [
+                    {
+                        "source_token": token,
+                        "scan_target": normalized_cidr,
+                        "input_type": "cidr",
+                        "expansion_type": "kept_as_cidr",
+                    }
+                ], None
+
+            # Expand CIDR into host IPs
+            if network.num_addresses == 1:
+                ip_list = [str(network.network_address)]
+            else:
+                ip_list = [str(ip) for ip in network.hosts()]
+
+            if len(ip_list) > max_ips_per_token:
+                return [], {
+                    "source_token": token,
+                    "reason": (
+                        f"CIDR expands to {len(ip_list)} host IPs, "
+                        f"above per-token limit {max_ips_per_token}"
+                    ),
+                }
+
+            expanded = [
+                {
+                    "source_token": token,
+                    "scan_target": ip,
+                    "input_type": "cidr",
+                    "expansion_type": "expanded_from_cidr",
+                }
+                for ip in ip_list
+            ]
+
+            return expanded, None
+
+        # Range
+        if "-" in token:
+            start_str, end_str = [part.strip() for part in token.split("-", 1)]
+
+            start_ip = ipaddress.ip_address(start_str)
+
+            # Full range: 192.168.1.20-192.168.1.25
+            if "." in end_str:
+                end_ip = ipaddress.ip_address(end_str)
+
+            # Last-octet shorthand: 192.168.1.20-25
+            else:
+                base_parts = start_str.split(".")
+                base_parts[-1] = end_str
+                end_ip = ipaddress.ip_address(".".join(base_parts))
+
+            start_int = int(start_ip)
+            end_int = int(end_ip)
+
+            if end_int < start_int:
+                start_int, end_int = end_int, start_int
+
+            count = end_int - start_int + 1
+
+            if count > max_ips_per_token:
+                return [], {
+                    "source_token": token,
+                    "reason": (
+                        f"Range expands to {count} IPs, "
+                        f"above per-token limit {max_ips_per_token}"
+                    ),
+                }
+
+            ip_list = [
+                str(ipaddress.ip_address(ip_int))
+                for ip_int in range(start_int, end_int + 1)
+            ]
+
+            expanded = [
+                {
+                    "source_token": token,
+                    "scan_target": ip,
+                    "input_type": "range",
+                    "expansion_type": "expanded_from_range",
+                }
+                for ip in ip_list
+            ]
+
+            return expanded, None
+
+        # Single IP
+        ip = ipaddress.ip_address(token)
+
+        return [
+            {
+                "source_token": token,
+                "scan_target": str(ip),
+                "input_type": "single_ip",
+                "expansion_type": "single_ip",
+            }
+        ], None
+
+    except ValueError as e:
+        return [], {
+            "source_token": token,
+            "reason": str(e),
+        }
 
 
-def validate_targets(raw_targets: list[str]) -> tuple[list[str], list[dict]]:
-    valid = []
-    invalid = []
+def build_scan_targets(
+    tokens: list[str],
+    cidr_mode: str,
+    max_ips_per_token: int,
+    max_total_targets: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Expand all input tokens and deduplicate scan targets.
+    """
 
-    for target in raw_targets:
-        try:
-            normalized = normalize_target(target)
-            valid.append(normalized)
-        except ValueError as e:
-            invalid.append({
-                "target": target,
-                "error": str(e),
-            })
+    expanded_rows = []
+    skipped_rows = []
 
-    # Deduplicate while preserving order
-    valid = list(dict.fromkeys(valid))
+    for token in tokens:
+        expanded, skipped = expand_single_token(
+            token=token,
+            cidr_mode=cidr_mode,
+            max_ips_per_token=max_ips_per_token,
+        )
 
-    return valid, invalid
+        expanded_rows.extend(expanded)
 
+        if skipped:
+            skipped_rows.append(skipped)
+
+    if not expanded_rows:
+        return pd.DataFrame(), pd.DataFrame(skipped_rows)
+
+    # Deduplicate by scan_target while preserving first source token
+    dedup = {}
+
+    for row in expanded_rows:
+        target = row["scan_target"]
+
+        if target not in dedup:
+            dedup[target] = row.copy()
+            dedup[target]["all_source_tokens"] = row["source_token"]
+        else:
+            existing_tokens = dedup[target]["all_source_tokens"].split(", ")
+            if row["source_token"] not in existing_tokens:
+                existing_tokens.append(row["source_token"])
+            dedup[target]["all_source_tokens"] = ", ".join(existing_tokens)
+
+    dedup_rows = list(dedup.values())
+
+    if len(dedup_rows) > max_total_targets:
+        skipped_rows.append({
+            "source_token": "TOTAL_LIMIT",
+            "reason": (
+                f"Expanded target count is {len(dedup_rows)}, "
+                f"above total limit {max_total_targets}. "
+                f"Increase the limit or use CIDR keep mode."
+            ),
+        })
+
+        dedup_rows = dedup_rows[:max_total_targets]
+
+    return pd.DataFrame(dedup_rows), pd.DataFrame(skipped_rows)
+
+
+# ============================================================
+# TARGET RANGE / VALIDATION HELPERS
+# ============================================================
 
 def get_target_range(target: str) -> tuple[str, str]:
     """
-    Return start IP and end IP for either IP or CIDR.
+    Return start IP and end IP for either single IP or CIDR.
     """
+
     if "/" in target:
         network = ipaddress.ip_network(target, strict=False)
         return str(network.network_address), str(network.broadcast_address)
@@ -94,8 +284,9 @@ def get_target_range(target: str) -> tuple[str, str]:
 
 def is_ip_inside_target(ip_value: str, target: str) -> bool:
     """
-    Confirm whether a returned leaked IP is inside the submitted IP/CIDR.
+    Confirm whether a returned leaked IP is inside the submitted scan target.
     """
+
     try:
         ip = ipaddress.ip_address(ip_value)
 
@@ -113,11 +304,18 @@ def is_ip_inside_target(ip_value: str, target: str) -> bool:
 # API RESPONSE EXTRACTION
 # ============================================================
 
-def extract_fortibleed_result(target: str, response_json: dict) -> dict:
+def extract_fortibleed_result(
+    scan_target: str,
+    source_token: str,
+    input_type: str,
+    expansion_type: str,
+    all_source_tokens: str,
+    response_json: dict,
+) -> dict:
     """
     Correct parser for real SOCRadar FortiBleed API response.
 
-    Real response structure:
+    Real structure:
 
     {
       "data": {
@@ -150,7 +348,7 @@ def extract_fortibleed_result(target: str, response_json: dict) -> dict:
     api_error = response_json.get("error", None)
     api_response_code = response_json.get("response_code", "")
 
-    query = data.get("query", target)
+    query = data.get("query", scan_target)
     query_type = data.get("query_type", "")
 
     is_detected = data.get("is_detected", False)
@@ -159,7 +357,7 @@ def extract_fortibleed_result(target: str, response_json: dict) -> dict:
     matches = data.get("matches", [])
     categories = data.get("categories", [])
 
-    # Fallback, in case API name changes again
+    # Fallback in case API field name changes
     if not categories:
         categories = data.get("detected_categories", [])
 
@@ -178,18 +376,22 @@ def extract_fortibleed_result(target: str, response_json: dict) -> dict:
         match_tags = match.get("tags", [])
 
         if value_type == "ip" and value:
-            inside_range = is_ip_inside_target(value, target)
+            inside_range = is_ip_inside_target(value, scan_target)
 
             leaked_ips.append(value)
 
             leaked_ip_details.append({
-                "target": target,
+                "source_token": source_token,
+                "all_source_tokens": all_source_tokens,
+                "scan_target": scan_target,
+                "input_type": input_type,
+                "expansion_type": expansion_type,
                 "query": query,
                 "query_type": query_type,
                 "leaked_ip": value,
                 "value_type": value_type,
                 "tags": ", ".join(match_tags),
-                "inside_submitted_range": inside_range,
+                "inside_submitted_target": inside_range,
             })
 
     detected_categories = []
@@ -200,7 +402,8 @@ def extract_fortibleed_result(target: str, response_json: dict) -> dict:
 
         if category.get("detected") is True:
             detected_categories.append({
-                "target": target,
+                "source_token": source_token,
+                "scan_target": scan_target,
                 "label": category.get("label", ""),
                 "count": category.get("count", 0),
                 "detected": category.get("detected", False),
@@ -212,7 +415,7 @@ def extract_fortibleed_result(target: str, response_json: dict) -> dict:
         if item.get("label")
     ]
 
-    range_start, range_end = get_target_range(target)
+    range_start, range_end = get_target_range(scan_target)
 
     status = "DETECTED" if is_detected else "NOT_DETECTED"
 
@@ -220,7 +423,11 @@ def extract_fortibleed_result(target: str, response_json: dict) -> dict:
         status = "API_ERROR"
 
     return {
-        "target": target,
+        "source_token": source_token,
+        "all_source_tokens": all_source_tokens,
+        "scan_target": scan_target,
+        "input_type": input_type,
+        "expansion_type": expansion_type,
         "query": query,
         "query_type": query_type,
         "range_start": range_start,
@@ -251,17 +458,23 @@ def extract_fortibleed_result(target: str, response_json: dict) -> dict:
 
 
 # ============================================================
-# API CALL FUNCTION
+# API CALL
 # ============================================================
 
 def query_fortibleed(
-    target: str,
+    target_row: dict,
     timeout: int = 20,
     retries: int = 2,
     retry_sleep: float = 2.0,
 ) -> dict:
+    scan_target = target_row["scan_target"]
+    source_token = target_row.get("source_token", scan_target)
+    input_type = target_row.get("input_type", "")
+    expansion_type = target_row.get("expansion_type", "")
+    all_source_tokens = target_row.get("all_source_tokens", source_token)
+
     payload = {
-        "query": target
+        "query": scan_target
     }
 
     for attempt in range(retries + 1):
@@ -289,7 +502,15 @@ def query_fortibleed(
                 }
 
             if response.status_code == 200:
-                result = extract_fortibleed_result(target, response_json)
+                result = extract_fortibleed_result(
+                    scan_target=scan_target,
+                    source_token=source_token,
+                    input_type=input_type,
+                    expansion_type=expansion_type,
+                    all_source_tokens=all_source_tokens,
+                    response_json=response_json,
+                )
+
                 result["http_status"] = response.status_code
                 result["elapsed_sec"] = elapsed
                 result["checked_at"] = datetime.now(timezone.utc).isoformat()
@@ -300,78 +521,87 @@ def query_fortibleed(
                 time.sleep(retry_sleep * (attempt + 1))
                 continue
 
-            return {
-                "target": target,
-                "query": target,
-                "query_type": "",
-                "range_start": "",
-                "range_end": "",
-
-                "status": "HTTP_ERROR",
-                "is_detected": False,
-                "match_count": 0,
-
-                "leaked_ip_count": 0,
-                "leaked_ips": "",
-
-                "exposure_type_count": 0,
-                "exposure_types": "",
-
-                "api_is_success": False,
-                "api_message": "",
-                "api_error": f"HTTP {response.status_code}",
-                "api_response_code": response.status_code,
-                "api_truncated": False,
-                "all_tags": "",
-
-                "detected_categories_json": "[]",
-                "leaked_ip_details_json": "[]",
-                "raw_response": json.dumps(response_json, ensure_ascii=False),
-
-                "http_status": response.status_code,
-                "elapsed_sec": elapsed,
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "error": f"HTTP {response.status_code}",
-            }
+            return build_error_result(
+                source_token=source_token,
+                all_source_tokens=all_source_tokens,
+                scan_target=scan_target,
+                input_type=input_type,
+                expansion_type=expansion_type,
+                status="HTTP_ERROR",
+                error=f"HTTP {response.status_code}",
+                http_status=response.status_code,
+                elapsed_sec=elapsed,
+                raw_response=response_json,
+            )
 
         except requests.RequestException as e:
             if attempt < retries:
                 time.sleep(retry_sleep * (attempt + 1))
                 continue
 
-            return {
-                "target": target,
-                "query": target,
-                "query_type": "",
-                "range_start": "",
-                "range_end": "",
+            return build_error_result(
+                source_token=source_token,
+                all_source_tokens=all_source_tokens,
+                scan_target=scan_target,
+                input_type=input_type,
+                expansion_type=expansion_type,
+                status="REQUEST_ERROR",
+                error=str(e),
+                http_status=None,
+                elapsed_sec=None,
+                raw_response={},
+            )
 
-                "status": "REQUEST_ERROR",
-                "is_detected": False,
-                "match_count": 0,
 
-                "leaked_ip_count": 0,
-                "leaked_ips": "",
+def build_error_result(
+    source_token: str,
+    all_source_tokens: str,
+    scan_target: str,
+    input_type: str,
+    expansion_type: str,
+    status: str,
+    error: str,
+    http_status,
+    elapsed_sec,
+    raw_response: dict,
+) -> dict:
+    return {
+        "source_token": source_token,
+        "all_source_tokens": all_source_tokens,
+        "scan_target": scan_target,
+        "input_type": input_type,
+        "expansion_type": expansion_type,
+        "query": scan_target,
+        "query_type": "",
+        "range_start": "",
+        "range_end": "",
 
-                "exposure_type_count": 0,
-                "exposure_types": "",
+        "status": status,
+        "is_detected": False,
+        "match_count": 0,
 
-                "api_is_success": False,
-                "api_message": "",
-                "api_error": str(e),
-                "api_response_code": "",
-                "api_truncated": False,
-                "all_tags": "",
+        "leaked_ip_count": 0,
+        "leaked_ips": "",
 
-                "detected_categories_json": "[]",
-                "leaked_ip_details_json": "[]",
-                "raw_response": "",
+        "exposure_type_count": 0,
+        "exposure_types": "",
 
-                "http_status": None,
-                "elapsed_sec": None,
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "error": str(e),
-            }
+        "api_is_success": False,
+        "api_message": "",
+        "api_error": error,
+        "api_response_code": "",
+        "api_truncated": False,
+        "all_tags": "",
+
+        "detected_categories_json": "[]",
+        "leaked_ip_details_json": "[]",
+        "raw_response": json.dumps(raw_response, ensure_ascii=False),
+
+        "http_status": http_status,
+        "elapsed_sec": elapsed_sec,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "error": error,
+    }
 
 
 # ============================================================
@@ -379,7 +609,7 @@ def query_fortibleed(
 # ============================================================
 
 def run_parallel_scan(
-    targets: list[str],
+    scan_df: pd.DataFrame,
     max_workers: int,
     timeout: int,
     retries: int,
@@ -390,65 +620,45 @@ def run_parallel_scan(
     progress_bar = st.progress(0)
     status_area = st.empty()
 
-    total = len(targets)
+    target_rows = scan_df.to_dict(orient="records")
+    total = len(target_rows)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(
                 query_fortibleed,
-                target,
+                target_row,
                 timeout,
                 retries,
                 retry_sleep,
-            ): target
-            for target in targets
+            ): target_row
+            for target_row in target_rows
         }
 
         for index, future in enumerate(as_completed(future_map), start=1):
-            target = future_map[future]
+            target_row = future_map[future]
 
             try:
                 result = future.result()
             except Exception as e:
-                result = {
-                    "target": target,
-                    "query": target,
-                    "query_type": "",
-                    "range_start": "",
-                    "range_end": "",
-
-                    "status": "LOCAL_ERROR",
-                    "is_detected": False,
-                    "match_count": 0,
-
-                    "leaked_ip_count": 0,
-                    "leaked_ips": "",
-
-                    "exposure_type_count": 0,
-                    "exposure_types": "",
-
-                    "api_is_success": False,
-                    "api_message": "",
-                    "api_error": str(e),
-                    "api_response_code": "",
-                    "api_truncated": False,
-                    "all_tags": "",
-
-                    "detected_categories_json": "[]",
-                    "leaked_ip_details_json": "[]",
-                    "raw_response": "",
-
-                    "http_status": None,
-                    "elapsed_sec": None,
-                    "checked_at": datetime.now(timezone.utc).isoformat(),
-                    "error": str(e),
-                }
+                result = build_error_result(
+                    source_token=target_row.get("source_token", ""),
+                    all_source_tokens=target_row.get("all_source_tokens", ""),
+                    scan_target=target_row.get("scan_target", ""),
+                    input_type=target_row.get("input_type", ""),
+                    expansion_type=target_row.get("expansion_type", ""),
+                    status="LOCAL_ERROR",
+                    error=str(e),
+                    http_status=None,
+                    elapsed_sec=None,
+                    raw_response={},
+                )
 
             results.append(result)
 
             progress_bar.progress(index / total)
             status_area.info(
-                f"Checked {index}/{total}: {result['target']} → {result['status']}"
+                f"Checked {index}/{total}: {result['scan_target']} → {result['status']}"
             )
 
     return pd.DataFrame(results)
@@ -502,23 +712,55 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🛡️ FortiBleed Exposure Checker by IP / CIDR")
+st.title("🛡️ FortiBleed Exposure Checker by IP / CIDR / Range")
 
 st.caption(
     "Use only for public IPs or CIDR ranges that you own or are authorized to assess. "
-    "This app calls the FortiBleed checker API directly and extracts detected IPs, "
-    "exposure categories, and range validation."
+    "This app supports single IP, CIDR, last-octet range, and full IP range input."
 )
 
 with st.sidebar:
     st.header("Scan Settings")
 
+    cidr_mode_label = st.radio(
+        "CIDR handling",
+        options=[
+            "Expand CIDR to individual host IPs",
+            "Keep CIDR as one API query",
+        ],
+        index=0,
+        help=(
+            "Expand mode checks each host IP. "
+            "Keep mode is faster for large subnet lists because the API accepts CIDR."
+        ),
+    )
+
+    cidr_mode = "expand" if cidr_mode_label.startswith("Expand") else "keep"
+
+    max_ips_per_token = st.number_input(
+        "Max expanded IPs per input token",
+        min_value=1,
+        max_value=1_000_000,
+        value=4096,
+        step=100,
+        help="Prevents accidental huge expansion such as /8.",
+    )
+
+    max_total_targets = st.number_input(
+        "Max total scan targets",
+        min_value=1,
+        max_value=1_000_000,
+        value=50000,
+        step=1000,
+        help="Overall safety limit after expansion and deduplication.",
+    )
+
     max_workers = st.slider(
         "Parallel requests",
         min_value=1,
-        max_value=20,
+        max_value=30,
         value=8,
-        help="For around 132 subnets, 8-10 is usually reasonable. Reduce if you get HTTP 429.",
+        help="For public/free APIs, start with 5-10. Reduce if you get HTTP 429.",
     )
 
     timeout = st.slider(
@@ -544,24 +786,31 @@ with st.sidebar:
     )
 
     st.divider()
-
     st.write("API Endpoint")
     st.code(API_URL)
 
 
-st.subheader("Input IP / CIDR")
+st.subheader("Input IP / CIDR / Range")
 
-default_input = "103.40.132.0/22"
+default_input = """103.40.132.0/22
+192.168.1.1
+192.168.1.20-25
+192.168.1.20-192.168.1.25
+A.192.168.2.0/30
+"""
 
 input_text = st.text_area(
-    "Paste IPs or CIDRs",
+    "Paste IPs, CIDRs, or ranges",
     value=default_input,
-    height=200,
-    help="One per line, or separated by comma, semicolon, tab, or space.",
+    height=240,
+    help=(
+        "Supported formats: single IP, CIDR, last-octet range, full IP range. "
+        "Labels like A. or B. before the IP are okay."
+    ),
 )
 
 uploaded_file = st.file_uploader(
-    "Optional: upload TXT or CSV file containing IPs/CIDRs",
+    "Optional: upload TXT or CSV file containing IPs/CIDRs/ranges",
     type=["txt", "csv"],
 )
 
@@ -570,35 +819,54 @@ uploaded_text = ""
 if uploaded_file is not None:
     uploaded_text = uploaded_file.read().decode("utf-8", errors="ignore")
 
-raw_targets = split_targets(input_text + "\n" + uploaded_text)
-valid_targets, invalid_targets = validate_targets(raw_targets)
 
-col1, col2 = st.columns(2)
-col1.metric("Valid targets", len(valid_targets))
-col2.metric("Invalid inputs", len(invalid_targets))
+combined_text = input_text + "\n" + uploaded_text
 
-if invalid_targets:
-    with st.expander("Invalid inputs"):
-        st.dataframe(pd.DataFrame(invalid_targets), use_container_width=True)
+tokens = extract_input_tokens(combined_text)
 
-with st.expander("Targets to scan"):
-    st.write(valid_targets)
+scan_df, skipped_df = build_scan_targets(
+    tokens=tokens,
+    cidr_mode=cidr_mode,
+    max_ips_per_token=int(max_ips_per_token),
+    max_total_targets=int(max_total_targets),
+)
 
+col1, col2, col3 = st.columns(3)
+col1.metric("Parsed input tokens", len(tokens))
+col2.metric("Scan targets after expansion", len(scan_df))
+col3.metric("Skipped inputs", len(skipped_df))
+
+with st.expander("Parsed input tokens"):
+    if tokens:
+        st.dataframe(pd.DataFrame({"token": tokens}), use_container_width=True)
+    else:
+        st.info("No valid IP-like tokens found.")
+
+with st.expander("Expanded scan targets"):
+    if len(scan_df) > 0:
+        st.dataframe(scan_df, use_container_width=True)
+    else:
+        st.info("No scan targets generated.")
+
+if len(skipped_df) > 0:
+    with st.expander("Skipped inputs / expansion warnings"):
+        st.dataframe(skipped_df, use_container_width=True)
 
 start_scan = st.button(
     "Start FortiBleed Check",
     type="primary",
-    disabled=len(valid_targets) == 0,
+    disabled=len(scan_df) == 0,
 )
 
 
 if start_scan:
     st.warning(
-        "Scanning started. If you see HTTP 429 or unstable results, reduce parallel requests."
+        "Scanning started. If you see HTTP 429 or unstable results, reduce parallel requests. "
+        "For many large CIDRs, consider using 'Keep CIDR as one API query'."
     )
 
     df = run_parallel_scan(
-        targets=valid_targets,
+        scan_df=scan_df,
         max_workers=max_workers,
         timeout=timeout,
         retries=retries,
@@ -641,7 +909,7 @@ if "result_df" in st.session_state:
 
     if len(detected_df) > 0:
         st.error(
-            f"Detected exposure in {len(detected_df)} target(s). "
+            f"Detected exposure in {len(detected_df)} scan target(s). "
             "Treat these as incident-response candidates."
         )
     else:
@@ -650,7 +918,11 @@ if "result_df" in st.session_state:
     st.subheader("Per Target Results")
 
     display_columns = [
-        "target",
+        "source_token",
+        "all_source_tokens",
+        "scan_target",
+        "input_type",
+        "expansion_type",
         "query",
         "query_type",
         "range_start",
@@ -697,10 +969,9 @@ if "result_df" in st.session_state:
         st.info("No detected categories returned.")
 
     with st.expander("Raw API Responses"):
-        st.dataframe(
-            df[["target", "raw_response"]],
-            use_container_width=True,
-        )
+        raw_cols = ["scan_target", "raw_response"]
+        raw_cols = [col for col in raw_cols if col in df.columns]
+        st.dataframe(df[raw_cols], use_container_width=True)
 
     st.subheader("Download Reports")
 
