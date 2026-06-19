@@ -10,9 +10,9 @@ import requests
 import streamlit as st
 
 
-API_URL_DEFAULT = "https://socradar.io/free-tools/api/fortibleed/search-fortibleed"
+API_URL = "https://socradar.io/free-tools/api/fortibleed/search-fortibleed"
 
-DEFAULT_HEADERS = {
+HEADERS = {
     "accept": "application/json, text/plain, */*",
     "content-type": "application/json",
     "origin": "https://socradar.io",
@@ -27,27 +27,21 @@ DEFAULT_HEADERS = {
 
 def split_targets(text: str) -> list[str]:
     """
-    Accepts newline, comma, semicolon, tab, or space separated IP/CIDR values.
+    Accept newline, comma, semicolon, tab, or space separated IP/CIDR values.
     """
     if not text:
         return []
 
-    raw_items = re.split(r"[\s,;]+", text.strip())
-    cleaned = []
-
-    for item in raw_items:
-        item = item.strip()
-        if item:
-            cleaned.append(item)
-
-    return cleaned
+    items = re.split(r"[\s,;]+", text.strip())
+    return [item.strip() for item in items if item.strip()]
 
 
 def normalize_target(target: str) -> str:
     """
-    Validate and normalize IP/CIDR.
-    Keeps single IP as single IP.
-    Keeps subnet as CIDR.
+    Validate and normalize IP or CIDR.
+    Example:
+    103.40.132.1     -> 103.40.132.1
+    103.40.132.5/22  -> 103.40.132.0/22
     """
     target = target.strip()
 
@@ -57,148 +51,140 @@ def normalize_target(target: str) -> str:
     return str(ipaddress.ip_address(target))
 
 
-def parse_and_validate_targets(raw_targets: list[str]) -> tuple[list[str], list[dict]]:
+def validate_targets(raw_targets: list[str]) -> tuple[list[str], list[dict]]:
     valid = []
     invalid = []
 
     for target in raw_targets:
         try:
-            normalized = normalize_target(target)
-            valid.append(normalized)
+            valid.append(normalize_target(target))
         except ValueError as e:
             invalid.append({
                 "target": target,
                 "error": str(e),
             })
 
-    # Remove duplicates while preserving order
+    # Deduplicate while preserving order
     valid = list(dict.fromkeys(valid))
 
     return valid, invalid
 
 
-def expand_cidrs_to_ips(targets: list[str], max_ips_per_cidr: int) -> tuple[list[str], list[dict]]:
+def get_target_range(target: str) -> tuple[str, str]:
     """
-    Optional mode. Disabled by default because the SOCRadar endpoint accepts CIDR.
-    This is useful only if you specifically want per-IP lookup.
+    Return start IP and end IP for either IP or CIDR.
     """
-    expanded = []
-    skipped = []
-
-    for target in targets:
-        if "/" not in target:
-            expanded.append(target)
-            continue
-
+    if "/" in target:
         network = ipaddress.ip_network(target, strict=False)
-        ip_count = network.num_addresses
+        return str(network.network_address), str(network.broadcast_address)
 
-        if ip_count > max_ips_per_cidr:
-            skipped.append({
-                "target": target,
-                "reason": f"CIDR has {ip_count} IPs, above limit {max_ips_per_cidr}",
-            })
-            expanded.append(target)
-            continue
-
-        for ip in network.hosts():
-            expanded.append(str(ip))
-
-    return list(dict.fromkeys(expanded)), skipped
+    ip = ipaddress.ip_address(target)
+    return str(ip), str(ip)
 
 
-def detect_result_status(response_json) -> tuple[str, str]:
+def is_ip_inside_target(ip_value: str, target: str) -> bool:
     """
-    Best-effort parser because hidden/free APIs may change response format.
-
-    Returns:
-    - EXPOSED
-    - NOT_FOUND
-    - REVIEW
+    Confirm whether a returned leaked IP is inside the submitted IP/CIDR.
     """
+    try:
+        ip = ipaddress.ip_address(ip_value)
 
-    raw = json.dumps(response_json, ensure_ascii=False).lower()
+        if "/" in target:
+            network = ipaddress.ip_network(target, strict=False)
+            return ip in network
 
-    # Strong negative indicators
-    negative_words = [
-        "not found",
-        "no record",
-        "no result",
-        "not leaked",
-        "not exposed",
-        "not affected",
-        "not compromised",
-    ]
+        return ip == ipaddress.ip_address(target)
 
-    for word in negative_words:
-        if word in raw:
-            return "NOT_FOUND", word
-
-    # Strong positive indicators
-    positive_words = [
-        "found",
-        "leaked",
-        "exposed",
-        "compromised",
-        "affected",
-        "credential",
-    ]
-
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                key = str(k).lower()
-
-                if key in [
-                    "found",
-                    "is_found",
-                    "isfound",
-                    "leaked",
-                    "exposed",
-                    "affected",
-                    "compromised",
-                    "is_compromised",
-                    "iscompromised",
-                    "success",
-                    "match",
-                    "matched",
-                ]:
-                    if v is True:
-                        return True
-
-                if key in ["data", "result", "results", "items", "records"]:
-                    if isinstance(v, list) and len(v) > 0:
-                        return True
-                    if isinstance(v, dict) and len(v) > 0:
-                        return True
-
-                if walk(v):
-                    return True
-
-        elif isinstance(obj, list):
-            if len(obj) > 0:
-                # Non-empty list may mean records were returned
-                return True
-
+    except ValueError:
         return False
 
-    if walk(response_json):
-        return "EXPOSED", "structured positive match"
 
-    for word in positive_words:
-        if word in raw:
-            return "REVIEW", f"contains keyword: {word}"
+def extract_fortibleed_result(target: str, data: dict) -> dict:
+    """
+    Extract clean fields from FortiBleed API response.
 
-    return "REVIEW", "unrecognized response format"
+    Expected response shape:
+
+    {
+      "is_detected": true,
+      "match_count": 1,
+      "matches": [
+        {
+          "tags": ["credential", "fortinet", "ssh", "vpn"],
+          "value": "103.40.134.178",
+          "value_type": "ip"
+        }
+      ],
+      "detected_categories": [
+        { "count": 1, "detected": true, "label": "VPN" },
+        { "count": 1, "detected": true, "label": "Credentials" },
+        { "count": 1, "detected": true, "label": "SSH" }
+      ]
+    }
+    """
+
+    is_detected = bool(data.get("is_detected", False))
+    match_count = data.get("match_count", 0)
+
+    matches = data.get("matches", [])
+    categories = data.get("detected_categories", [])
+
+    leaked_ips = []
+    leaked_ip_details = []
+
+    for match in matches:
+        value = match.get("value")
+        value_type = match.get("value_type")
+        tags = match.get("tags", [])
+
+        if value_type == "ip" and value:
+            inside_range = is_ip_inside_target(value, target)
+
+            leaked_ips.append(value)
+            leaked_ip_details.append({
+                "target": target,
+                "leaked_ip": value,
+                "value_type": value_type,
+                "tags": ", ".join(tags),
+                "inside_submitted_range": inside_range,
+            })
+
+    detected_categories = []
+
+    for category in categories:
+        if category.get("detected") is True:
+            detected_categories.append({
+                "label": category.get("label"),
+                "count": category.get("count", 0),
+            })
+
+    exposure_labels = [item["label"] for item in detected_categories if item["label"]]
+
+    range_start, range_end = get_target_range(target)
+
+    if is_detected:
+        status = "DETECTED"
+    else:
+        status = "NOT_DETECTED"
+
+    return {
+        "target": target,
+        "range_start": range_start,
+        "range_end": range_end,
+        "status": status,
+        "is_detected": is_detected,
+        "match_count": match_count,
+        "leaked_ip_count": len(leaked_ips),
+        "leaked_ips": ", ".join(leaked_ips),
+        "exposure_type_count": len(exposure_labels),
+        "exposure_types": ", ".join(exposure_labels),
+        "detected_categories_json": json.dumps(detected_categories, ensure_ascii=False),
+        "leaked_ip_details_json": json.dumps(leaked_ip_details, ensure_ascii=False),
+        "raw_response": json.dumps(data, ensure_ascii=False),
+    }
 
 
-def query_fortibleed(
-    target: str,
-    api_url: str,
-    timeout: int,
-    retries: int,
-    retry_sleep: float,
-) -> dict:
+def query_fortibleed(target: str, timeout: int = 20, retries: int = 2) -> dict:
     payload = {"query": target}
 
     for attempt in range(retries + 1):
@@ -206,8 +192,8 @@ def query_fortibleed(
 
         try:
             response = requests.post(
-                api_url,
-                headers=DEFAULT_HEADERS,
+                API_URL,
+                headers=HEADERS,
                 json=payload,
                 timeout=timeout,
             )
@@ -215,90 +201,107 @@ def query_fortibleed(
             elapsed = round(time.time() - started, 3)
 
             try:
-                response_json = response.json()
+                data = response.json()
             except Exception:
-                response_json = {
-                    "raw_text": response.text[:2000],
+                data = {
+                    "raw_text": response.text[:3000],
                 }
 
             if response.status_code == 200:
-                status, reason = detect_result_status(response_json)
-
-                return {
-                    "target": target,
-                    "status": status,
-                    "http_status": response.status_code,
-                    "reason": reason,
-                    "elapsed_sec": elapsed,
-                    "checked_at": datetime.utcnow().isoformat() + "Z",
-                    "raw_response": json.dumps(response_json, ensure_ascii=False),
-                }
+                result = extract_fortibleed_result(target, data)
+                result["http_status"] = response.status_code
+                result["elapsed_sec"] = elapsed
+                result["checked_at"] = datetime.utcnow().isoformat() + "Z"
+                result["error"] = ""
+                return result
 
             if response.status_code in [429, 500, 502, 503, 504] and attempt < retries:
-                time.sleep(retry_sleep * (attempt + 1))
+                time.sleep(2 * (attempt + 1))
                 continue
 
             return {
                 "target": target,
                 "status": "ERROR",
+                "is_detected": False,
+                "match_count": 0,
+                "leaked_ip_count": 0,
+                "leaked_ips": "",
+                "exposure_type_count": 0,
+                "exposure_types": "",
                 "http_status": response.status_code,
-                "reason": f"HTTP {response.status_code}",
                 "elapsed_sec": elapsed,
                 "checked_at": datetime.utcnow().isoformat() + "Z",
-                "raw_response": json.dumps(response_json, ensure_ascii=False),
+                "error": f"HTTP {response.status_code}",
+                "raw_response": json.dumps(data, ensure_ascii=False),
             }
 
         except requests.RequestException as e:
             if attempt < retries:
-                time.sleep(retry_sleep * (attempt + 1))
+                time.sleep(2 * (attempt + 1))
                 continue
 
             return {
                 "target": target,
                 "status": "ERROR",
+                "is_detected": False,
+                "match_count": 0,
+                "leaked_ip_count": 0,
+                "leaked_ips": "",
+                "exposure_type_count": 0,
+                "exposure_types": "",
                 "http_status": None,
-                "reason": str(e),
                 "elapsed_sec": None,
                 "checked_at": datetime.utcnow().isoformat() + "Z",
+                "error": str(e),
                 "raw_response": "",
             }
 
 
-def run_parallel_scan(
-    targets: list[str],
-    api_url: str,
-    max_workers: int,
-    timeout: int,
-    retries: int,
-    retry_sleep: float,
-) -> pd.DataFrame:
+def run_parallel_scan(targets: list[str], max_workers: int, timeout: int, retries: int) -> pd.DataFrame:
     results = []
-    progress = st.progress(0)
-    status_box = st.empty()
+
+    progress_bar = st.progress(0)
+    status_area = st.empty()
 
     total = len(targets)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(
-                query_fortibleed,
-                target,
-                api_url,
-                timeout,
-                retries,
-                retry_sleep,
-            ): target
+            executor.submit(query_fortibleed, target, timeout, retries): target
             for target in targets
         }
 
-        for idx, future in enumerate(as_completed(future_map), start=1):
+        for index, future in enumerate(as_completed(future_map), start=1):
             result = future.result()
             results.append(result)
 
-            progress.progress(idx / total)
-            status_box.info(f"Checked {idx}/{total}: {result['target']} -> {result['status']}")
+            progress_bar.progress(index / total)
+            status_area.info(
+                f"Checked {index}/{total}: {result['target']} → {result['status']}"
+            )
 
     return pd.DataFrame(results)
+
+
+def build_ip_detail_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert leaked_ip_details_json into a separate table:
+    one row per leaked IP.
+    """
+    rows = []
+
+    for _, row in df.iterrows():
+        details_json = row.get("leaked_ip_details_json", "[]")
+
+        try:
+            details = json.loads(details_json)
+        except Exception:
+            details = []
+
+        for item in details:
+            rows.append(item)
+
+    return pd.DataFrame(rows)
 
 
 st.set_page_config(
@@ -308,30 +311,25 @@ st.set_page_config(
 )
 
 st.title("🛡️ FortiBleed Exposure Checker by IP / CIDR")
+
 st.caption(
-    "Use only for assets you own or are authorized to assess. "
-    "This app calls the same style of backend endpoint used by the public checker, "
-    "but with controlled batching instead of manual UI clicking."
+    "Input public IPs or CIDR ranges that you own or are authorized to assess. "
+    "The app calls the FortiBleed API directly and extracts detected IPs, exposure categories, and range validation."
 )
 
 with st.sidebar:
-    st.header("Settings")
-
-    api_url = st.text_input(
-        "API endpoint",
-        value=API_URL_DEFAULT,
-    )
+    st.header("Scan Settings")
 
     max_workers = st.slider(
         "Parallel requests",
         min_value=1,
         max_value=20,
         value=8,
-        help="Use lower value if you see rate limiting.",
+        help="For 132 subnets, 8-10 is usually reasonable. Reduce if you get HTTP 429.",
     )
 
     timeout = st.slider(
-        "Request timeout seconds",
+        "Timeout per request",
         min_value=5,
         max_value=60,
         value=20,
@@ -344,44 +342,19 @@ with st.sidebar:
         value=2,
     )
 
-    retry_sleep = st.slider(
-        "Retry backoff seconds",
-        min_value=0.5,
-        max_value=10.0,
-        value=2.0,
-        step=0.5,
-    )
+st.subheader("Input IP / CIDR")
 
-    expand_cidr = st.checkbox(
-        "Expand CIDR to individual IPs",
-        value=False,
-        help="Normally keep this OFF because the endpoint accepts CIDR queries.",
-    )
-
-    max_ips_per_cidr = st.number_input(
-        "Max IPs to expand per CIDR",
-        min_value=1,
-        max_value=4096,
-        value=256,
-        disabled=not expand_cidr,
-    )
-
-st.subheader("Input IPs or CIDRs")
-
-sample = """203.0.113.10
-198.51.100.0/24
-192.0.2.5
-"""
+default_example = "103.40.132.0/22"
 
 input_text = st.text_area(
-    "Paste IPs/CIDRs, one per line or comma-separated",
-    value="",
-    height=200,
-    placeholder=sample,
+    "Paste IPs or CIDRs",
+    value=default_example,
+    height=180,
+    help="One per line, or separated by comma/space.",
 )
 
 uploaded_file = st.file_uploader(
-    "Or upload TXT/CSV with IPs/CIDRs",
+    "Optional: upload TXT or CSV file",
     type=["txt", "csv"],
 )
 
@@ -391,95 +364,93 @@ if uploaded_file is not None:
     uploaded_text = uploaded_file.read().decode("utf-8", errors="ignore")
 
 raw_targets = split_targets(input_text + "\n" + uploaded_text)
-valid_targets, invalid_targets = parse_and_validate_targets(raw_targets)
+valid_targets, invalid_targets = validate_targets(raw_targets)
 
-if expand_cidr and valid_targets:
-    valid_targets, skipped_expansion = expand_cidrs_to_ips(
-        valid_targets,
-        max_ips_per_cidr=int(max_ips_per_cidr),
-    )
-else:
-    skipped_expansion = []
-
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 col1.metric("Valid targets", len(valid_targets))
 col2.metric("Invalid inputs", len(invalid_targets))
-col3.metric("Skipped CIDR expansion", len(skipped_expansion))
 
 if invalid_targets:
     with st.expander("Invalid inputs"):
         st.dataframe(pd.DataFrame(invalid_targets), use_container_width=True)
 
-if skipped_expansion:
-    with st.expander("CIDRs not expanded"):
-        st.dataframe(pd.DataFrame(skipped_expansion), use_container_width=True)
-
-with st.expander("Targets to check"):
+with st.expander("Targets to scan"):
     st.write(valid_targets)
 
-scan_button = st.button(
-    "Start FortiBleed Check",
-    type="primary",
-    disabled=len(valid_targets) == 0,
-)
-
-if scan_button:
-    st.warning(
-        "Scanning started. Avoid very high parallelism against free public services. "
-        "If you receive HTTP 429, reduce parallel requests."
-    )
-
+if st.button("Start FortiBleed Check", type="primary", disabled=len(valid_targets) == 0):
     df = run_parallel_scan(
         targets=valid_targets,
-        api_url=api_url,
         max_workers=max_workers,
         timeout=timeout,
         retries=retries,
-        retry_sleep=retry_sleep,
     )
 
     st.subheader("Summary")
 
-    summary = (
+    summary_df = (
         df.groupby("status")
         .size()
         .reset_index(name="count")
         .sort_values("count", ascending=False)
     )
 
-    st.dataframe(summary, use_container_width=True)
+    st.dataframe(summary_df, use_container_width=True)
 
-    exposed_df = df[df["status"] == "EXPOSED"]
-    review_df = df[df["status"] == "REVIEW"]
+    detected_df = df[df["status"] == "DETECTED"]
+    not_detected_df = df[df["status"] == "NOT_DETECTED"]
     error_df = df[df["status"] == "ERROR"]
 
-    if len(exposed_df) > 0:
-        st.error(f"Found {len(exposed_df)} exposed / matched target(s). Treat as incident.")
-        st.dataframe(exposed_df.drop(columns=["raw_response"]), use_container_width=True)
+    if len(detected_df) > 0:
+        st.error(f"Detected exposure in {len(detected_df)} target(s).")
     else:
-        st.success("No clear EXPOSED result detected by the parser.")
+        st.success("No detected exposure found in the scanned targets.")
 
-    if len(review_df) > 0:
-        st.warning(
-            f"{len(review_df)} result(s) need manual review because the API response format was ambiguous."
-        )
-        st.dataframe(review_df.drop(columns=["raw_response"]), use_container_width=True)
+    st.subheader("Per Subnet / IP Result")
 
-    if len(error_df) > 0:
-        st.error(f"{len(error_df)} request(s) returned errors.")
-        st.dataframe(error_df.drop(columns=["raw_response"]), use_container_width=True)
+    display_columns = [
+        "target",
+        "range_start",
+        "range_end",
+        "status",
+        "match_count",
+        "leaked_ip_count",
+        "leaked_ips",
+        "exposure_type_count",
+        "exposure_types",
+        "http_status",
+        "elapsed_sec",
+        "checked_at",
+        "error",
+    ]
 
-    st.subheader("Full Results")
-    st.dataframe(df.drop(columns=["raw_response"]), use_container_width=True)
+    existing_display_columns = [c for c in display_columns if c in df.columns]
+    st.dataframe(df[existing_display_columns], use_container_width=True)
+
+    ip_detail_df = build_ip_detail_table(df)
+
+    st.subheader("Specific Leaked IP Details")
+
+    if len(ip_detail_df) > 0:
+        st.dataframe(ip_detail_df, use_container_width=True)
+    else:
+        st.info("No leaked IP details returned.")
 
     with st.expander("Raw API Responses"):
-        st.dataframe(df[["target", "status", "raw_response"]], use_container_width=True)
+        st.dataframe(df[["target", "raw_response"]], use_container_width=True)
 
-    csv_data = df.to_csv(index=False).encode("utf-8-sig")
-
+    csv_summary = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        label="Download CSV Report",
-        data=csv_data,
-        file_name=f"fortibleed_check_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        "Download Summary CSV",
+        data=csv_summary,
+        file_name=f"fortibleed_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
     )
+
+    if len(ip_detail_df) > 0:
+        csv_ip_detail = ip_detail_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Download Leaked IP Detail CSV",
+            data=csv_ip_detail,
+            file_name=f"fortibleed_leaked_ip_detail_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+        )
